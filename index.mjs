@@ -13,6 +13,7 @@ import jwt from 'jsonwebtoken'
 import { promisify } from 'util'
 import crypto from 'crypto'
 import winston from 'winston'
+import fetch from "node-fetch"
 
 // Configuration
 
@@ -34,6 +35,7 @@ const PENDING_CONTEXT = 'https://purl.archive.org/socialweb/pending'
 const CONTEXT = [AS_CONTEXT, SEC_CONTEXT, BLOCKED_CONTEXT, PENDING_CONTEXT]
 
 const PUBLIC = 'https://www.w3.org/ns/activitystreams#Public'
+const PUBLICS = [PUBLIC, "as:Public", "Public"]
 const PUBLIC_OBJ = { id: PUBLIC, nameMap: { en: 'Public' }, type: 'Collection' }
 const MAX_PAGE_SIZE = 20
 
@@ -152,9 +154,11 @@ class HTTPSignature {
       }
     }
     const data = lines.join('\n')
-    const publicKey = await ActivityObject.fromRemote(this.keyId)
+    const ao = await ActivityObject.fromRemote(this.keyId)
 
-    if (!await publicKey.json() || !await publicKey.prop('owner') || !await publicKey.prop('publicKeyPem')) {
+    const actor = await ao.json()
+    const publicKey = actor.publicKey
+    if (!publicKey || !publicKey.owner || !publicKey.publicKeyPem) {
       return null
     }
 
@@ -162,11 +166,11 @@ class HTTPSignature {
     verifier.write(data)
     verifier.end()
 
-    if (verifier.verify(await publicKey.prop('publicKeyPem'), Buffer.from(this.signature, 'base64'))) {
-      const ownerId = await publicKey.prop('owner')
+    if (verifier.verify(await publicKey.publicKeyPem, Buffer.from(this.signature, 'base64'))) {
+      const ownerId = await publicKey.owner
       const owner = await ActivityObject.fromRemote(ownerId)
       await owner.cache(ownerId, [PUBLIC])
-      await publicKey.cache(ownerId, [PUBLIC])
+      await ao.cache(ownerId, [PUBLIC])
       return owner
     } else {
       return null
@@ -399,10 +403,14 @@ class ActivityObject {
         return false
       }
     }
+
     // anyone can read if it's public
-    if (addresseeIds.includes(PUBLIC)) {
-      return true
+    for (const addresseeId of addresseeIds) {
+      if (PUBLICS.includes(addresseeId)) {
+        return true
+      }
     }
+
     // otherwise, unauthenticated can't read
     if (!subject) {
       return false
@@ -1050,7 +1058,7 @@ class Activity extends ActivityObject {
           const coll = new Collection(addressee)
           const objOwner = await obj.owner()
           if (coll &&
-              await objOwner.id() === await owner.id()) {
+            await objOwner.id() === await owner.id()) {
             return await coll.members()
           }
         }
@@ -1093,7 +1101,9 @@ class Activity extends ActivityObject {
     }
 
     for (const addressee of expanded) {
-      pq.add(sendTo(addressee))
+      if (!PUBLICS.includes(addressee)) {
+        pq.add(sendTo(addressee))
+      }
     }
   }
 }
@@ -1668,7 +1678,7 @@ const logger = winston.createLogger({
 sqlite3.verbose()
 
 // Initialize SQLite
-const db = new Database(DATABASE)
+let db = new Database(DATABASE)
 
 // Initialize PromiseQueue
 
@@ -1697,6 +1707,22 @@ passport.use(new LocalStrategy(
 
   }
 ))
+
+// TODO Move this to another file
+app.get('/test/reset', wrap(async (req, res) => {
+  console.log("reset database")
+  db = new Database(DATABASE)
+  res.status(200)
+  res.end('Reset')
+}))
+
+app.get('/test/data', wrap(async (req, res) => {
+  const users = await db.all('SELECT username, actorId FROM user')
+  const objects = await db.all('SELECT id, owner, data FROM object')
+  const addressees = await db.all('SELECT objectId, addresseeId FROM addressee')
+  res.status(200)
+  res.json({ users, objects, addressees })
+}))
 
 app.get('/', wrap(async (req, res) => {
   const url = req.protocol + '://' + req.get('host') + req.originalUrl
@@ -1759,6 +1785,8 @@ app.post('/register', wrap(async (req, res) => {
   )
   res.type('html')
   res.status(200)
+  res.header('X-Opp-Actor', user.actorId)
+  res.header('X-Opp-Token', token)
   res.end(`
     <html>
     <head>
@@ -1929,8 +1957,9 @@ app.post('/:type/:id',
       pq.add(activity.distribute(addressees))
       const output = await activity.expanded()
       output['@context'] = output['@context'] || CONTEXT
-      res.status(200)
+      res.status(201)
       res.set('Content-Type', 'application/activity+json')
+      res.set('Location', await activity.id())
       res.json(output)
     } else if (full === await owner.prop('inbox')) { // remote delivery
       if (!req.auth?.subject) {
